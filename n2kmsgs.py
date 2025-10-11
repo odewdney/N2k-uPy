@@ -72,8 +72,6 @@ class n2kField:
         self.index=index
         self.offset=offset
         self.default=default
-        if scale is not None: self.scale=scale
-        if unit is not None: self.unit=unit
         if repr is not None: self.repr=repr
         if enum: self.enum=enum
         if name: self.name=name
@@ -100,16 +98,16 @@ class n2kField:
         raise Exception("not imp")
     def init(self,obj):
         if self.default is not None:
-            if len(obj.data)<=self.GetOffset(obj):
+            if len(obj.data)<=self.GetOffset(obj) and self.GetFieldSize(obj)>0:
                 setattr(obj,self.name,self.default)
     def GetValueSize(self,obj):
         return self.fieldsize
     def GetFieldSize(self,obj):
         return self.fieldsize
     def GetOffset(self,obj):
-        if isinstance(self.offset, n2kField):
-            return self.offset.GetEndOffset(obj)
-        return self.offset
+        if isinstance(self.offset, int):
+            return self.offset
+        return self.offset.GetEndOffset(obj)
     def GetEndOffset(self,obj):
         return self.GetOffset(obj)+self.GetFieldSize(obj)
     def GetSlice(self,obj,length): # length is min size
@@ -151,12 +149,15 @@ class n2kByteField(n2kField):
         s[offset] = (s[offset] & mask) | value
 
 class n2kUIntNField(n2kField):
-    def __init__(self,index,offset,size,bits=None,bitoffset=0,**kwargs):
+    def __init__(self,index,offset,size,bits=None,bitoffset=0,order="little",scale=None,valueoffset=None,unit=None,**kwargs):
         super().__init__(index,offset,**kwargs)
         self.bitoffset=bitoffset
         self.bits=bits or size*8
         self.fieldsize=size
-        self.order="little"
+        self.order=order
+        if scale is not None: self.scale=scale
+        if valueoffset is not None: self.voffset=valueoffset
+        if unit is not None: self.unit=unit
     def clone(self,index,offset):
         return super().clone(index,offset,bits=self.bits,bitoffset=self.bitoffset)
     def __get__(self,obj,objtype=None):
@@ -164,8 +165,10 @@ class n2kUIntNField(n2kField):
         value=int.from_bytes(b,self.order)
         value=(value >> self.bitoffset) & ((1<<self.bits)-1)
         if hasattr(self,"scale"): value*=self.scale
+        if hasattr(self,"voffset"): value+=self.voffset
         return value
     def __set__(self,obj,value):
+        if hasattr(self,"voffset"): value-=self.voffset
         if hasattr(self,"scale"): value=round(value/self.scale)
         b=self.GetFieldSlice(obj)
         data=int.from_bytes(b,self.order)
@@ -173,9 +176,14 @@ class n2kUIntNField(n2kField):
         value= (value&mask)<<self.bitoffset
         mask=~(mask<<self.bitoffset)
         data = (data & mask) | value
+        if p: print(f"setting {b.hex()} {self.fieldsize} {data.to_bytes(self.fieldsize,self.order).hex()}")
         b[0:self.fieldsize]=data.to_bytes(self.fieldsize,self.order)
     def GetValueSize(self):
         return (self.bits+7)//8
+
+class n2kUInt8Field(n2kUIntNField):
+    def __init__(self,index,offset,bitoffset=0,bits=8,**kwargs):
+        super().__init__(index,offset,1,bitoffset=bitoffset,bits=bits,**kwargs)
 
 class n2kUInt16Field(n2kUIntNField):
     def __init__(self,index,offset,bitoffset=0,bits=16,**kwargs):
@@ -491,10 +499,6 @@ class n2kCompoundField(n2kField):
     def GetSlice(self,length):
         offset=self.GetOffset(self.obj)
         return self.obj.GetSlice(offset+length)[offset:]
-    def GetOffset(self,obj):
-        if isinstance(self.offset, n2kField):
-            return self.offset.GetEndOffset(self.obj)
-        return self.offset
     def GetFieldSize(self,obj):
         sz=0
         for f in self.fields:
@@ -508,8 +512,8 @@ class n2kParamObj(n2kCompoundField):
     Index=n2kByteField(1,0)
     Value=n2kParamField(2,1)
 
-class n2kParamArrayImpl:
-    def __init__(self,obj,index,offset,count,type,name):
+class n2kArrayFieldImpl:
+    def __init__(self,obj,index,offset,type,count,name):
         self.obj=obj
         self.index=index
         self.offset=offset
@@ -520,40 +524,66 @@ class n2kParamArrayImpl:
         if not hasattr(obj,"data"):
             self._SetCount()
     def __getitem__(self,key):
-        return self.entries[key]
+        ret=self.entries[key]
+        if isinstance(ret,n2kCompoundField):
+            return ret
+        return ret.__get__(self.obj,None)
     def __setitem__(self,key,value):
-        pass
+        ret=self.entries[key]
+        if isinstance(ret,n2kCompoundField):
+            raise Exception("cant set field")
+        ret.__set__(self.obj,value)
     def __len__(self):
         return len(self.entries)
     def _SetCount(self):
-        c=len(self.entries)
-        self.count.__set__(self.obj,c)
+        if self.count: self.count.__set__(self.obj,len(self.entries))
     def _GetCount(self):
-        return self.count.__get__(self.obj)
+        return self.count.__get__(self.obj,None)
     def GetOffset(self,obj):
-        if isinstance(self.offset, n2kField):
-            return self.offset.GetEndOffset(obj)
-        return self.offset
-    def add(self,setcount=True):
+        if isinstance(self.offset, int):
+            return self.offset
+        return self.offset.GetEndOffset(obj)
+    def GetFieldSize(self,obj):
+        sz=0
+        for e in self.entries:
+            sz+=e.GetFieldSize(self.obj)
+        return sz
+    def _add(self):
         l=len(self.entries)
         offset = self.GetOffset(self.obj)
         if l>0:
             last=self.entries[l-1]
             offset = last#.GetEndOffset(self.obj)
-        val=self.type(self.obj,self.index+l*len(self.type.fields),offset)
+        if issubclass(self.type,n2kCompoundField):
+            num = len(self.type.fields) if hasattr(self.type,"fields") else 1
+            val=self.type(self.obj,self.index+l*num,offset)
+        else:
+            val=self.type(self.index+l,offset)
         val.__set_name__(self.obj,f"{self.name}[{l}]")
         self.entries.append(val)
-        if setcount:
-            self._SetCount()
+        return l
+    def add(self):
+        l=self._add()
+        self._SetCount()
         return l
     def init(self,obj):
         if p: print(f"init {obj}")
-        if hasattr(obj,"data") and len(obj.data)>self.offset:
-            for n in range(self._GetCount()):
-                self.add(False)
+        if not hasattr(obj,"data"): return
+        data=obj.data
+        offset=self.GetOffset(obj)
+        if len(data)>offset:
+            if self.count:
+                for n in range(self._GetCount()):
+                    self._add()
+            elif len(data)>0:
+                while offset<len(data):
+                    n=self._add()
+                    offset=self.entries[n].GetEndOffset(obj)
+                if offset!=len(data):
+                    raise Exception("bad array data")
 
-class n2kParamArray(n2kField):
-    def __init__(self,index,offset,count,type):
+class n2kArrayField(n2kField):
+    def __init__(self,index,offset,type,count=None):
         super().__init__(0,offset)
         self.count=count
         self.aindex=index
@@ -561,9 +591,12 @@ class n2kParamArray(n2kField):
     def __get__(self,obj,objtype=None):
         val=getattr(obj,"_"+self.name,None)
         if not val:
-            val=n2kParamArrayImpl(obj,self.aindex,self.offset,self.count,self.type,self.name)
+            val=n2kArrayFieldImpl(obj,self.aindex,self.offset,self.type,self.count,self.name)
             setattr(obj,"_"+self.name,val)
         return val
+    def GetFieldSize(self,obj):
+        val=getattr(obj,"_"+self.name,None)
+        return val.GetFieldSize(obj) if val else 0
     def init(self,obj):
         print("init1")
 
@@ -572,24 +605,40 @@ class n2kNMEARequestGroupMsg(n2kNMEAGroupFunctionBase):
     TransmissionInterval = n2kUInt32Field(3,4,scale=0.001,unit="s")
     TransmissionOffset = n2kUInt16Field(4,8,scale=0.01,unit="s")
     ParameterCount = n2kByteField(5,10)
-    Parameters = n2kParamArray(6,11,count=ParameterCount,type=n2kParamObj)
+    Parameters = n2kArrayField(6,11,type=n2kParamObj,count=ParameterCount)
 
 @n2kMsgType(pgn=126208, priority=3, match=b'\x01') # 0x1ED00
 class n2kNMEACommandGroupMsg(n2kNMEAGroupFunctionBase):
     Priority = n2kByteField(3,4,bits=4)
     Reserved = n2kByteField(4,4,bits=4,bitoffset=4)
     ParameterCount = n2kByteField(5,5)
-    Parameters = n2kParamArray(6,6,count=ParameterCount,type=n2kParamObj)
+    Parameters = n2kArrayField(6,6,type=n2kParamObj,count=ParameterCount)
 
 @n2kMsgType(pgn=126208, priority=3, match=b'\x02') # 0x1ED00
 class n2kNMEAAckGroupMsg(n2kNMEAGroupFunctionBase):
     ErrorCode = n2kByteField(3,4,bits=4)
     ErrorCode2 = n2kByteField(4,4,bits=4,bitoffset=4)
+    ParameterCount = n2kByteField(5,5)
+    Parameters = n2kArrayField(6,6,type=n2kByteField,count=ParameterCount)
+
+class n2kUInt16FieldX(n2kUInt16Field):
+    def GetFieldSize(self,obj):
+        m=msgs.get(obj.PGN)
+        if m and m.manu:
+            return super().GetFieldSize(obj)
+        return 0
 
 @n2kMsgType(pgn=126208, priority=3, match=b'\x03') # 0x1ED00
 class n2kNMEAReadFieldsGroupMsg(n2kNMEAGroupFunctionBase):
-    pass    
-
+    ManufacturerCode = n2kUInt16FieldX(3,4,bitoffset=0,bits=11,repr='mcode')
+    reserved = n2kUInt16FieldX(4,4,bitoffset=11,bits=2,repr='mcode')
+    IndustryGroup = n2kUInt16FieldX(5,4,bits=3,bitoffset=13,default=4,repr='ig',enum=n2kIndustryCode) # marine
+    UniqueID = n2kByteField(6,IndustryGroup)
+    SelectionCount = n2kByteField(7,UniqueID)
+    ParameterCount = n2kByteField(8,SelectionCount)
+    Selections = n2kArrayField(9,ParameterCount,type=n2kParamObj,count=SelectionCount)
+    Parameters = n2kArrayField(10,Selections,type=n2kByteField,count=ParameterCount)
+                               
 @n2kMsgType(pgn=126208, priority=3, match=b'\x04') # 0x1ED00
 class n2kNMEAReadFieldsReplyGroupMsg(n2kNMEAGroupFunctionBase):
     pass    
@@ -601,69 +650,6 @@ class n2kNMEAWriteFieldsGroupMsg(n2kNMEAGroupFunctionBase):
 @n2kMsgType(pgn=126208, priority=3, match=b'\x06') # 0x1ED00
 class n2kNMEAWriteFieldsReplyGroupMsg(n2kNMEAGroupFunctionBase):
     pass    
-
-class n2kArrayEntry():
-    def __init__(self,obj,index,offset,type,name):
-        self.obj=obj
-        self.index=index
-        self.offset=offset
-        self.type=type
-        self.name=name
-        self.entries=[]
-        data=obj.data
-        if len(data)>0:
-            offset=self.GetOffset(obj)
-            while offset<len(data):
-                entry=type(index,offset)
-                entry.__set_name__(obj,f"{name}[{len(self.entries)}]")
-                self.entries.append(entry)
-                offset+=entry.GetFieldSize(obj)
-                index+=1
-            if offset!=len(data):
-                raise Exception("bad array data")
-    def __getitem__(self,key):
-        ret=self.entries[key]
-        if isinstance(ret,n2kField):
-            return ret.__get__(self.obj,None)
-        return ret
-    def __setitem__(self,key,value):
-        ret=self.entries[key]
-        if isinstance(ret,n2kField):
-            ret.__set__(self.obj,value)
-        else:
-            raise Exception("cant set field")
-    def __len__(self):
-        return len(self.entries)
-    def __repr__(self):
-        return self.entries
-    def GetOffset(self,obj):
-        if isinstance(self.offset, n2kField):
-            return self.offset.GetEndOffset(obj)
-        return self.offset
-    def add(self):
-        l=len(self.entries)
-        offset = self.GetOffset(self.obj) if l==0 else self.entries[l-1].GetEndOffset(self.obj)
-        val=self.type(self.index+l,offset)
-        val.__set_name__(self.obj,f"{self.name}[{l}]")
-        self.entries.append(val)
-        self.count.__set__(self.obj,l+1)
-        return l
-    def init(self,obj):
-        pass
-    
-class n2kArrayField(n2kField):
-    def __init__(self,index,offset,type):
-        super().__init__(0,offset)
-        self.type=type
-        self.aindex=index
-    def __get__(self,obj,objtype=None):
-        val=getattr(obj,"_"+self.name,None)
-        if not val:
-            val=n2kArrayEntry(obj,self.aindex,self.offset,self.type,self.name)
-            setattr(obj,"_"+self.name,val)
-        return val
-    def init(self,obj):
-        pass
 
 @n2kMsgType(pgn=126464) # 0x1EE00
 class n2kNMEAPGNList(n2kMsg):
