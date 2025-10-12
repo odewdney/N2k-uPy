@@ -1,43 +1,30 @@
+import asyncio
+import logging
+from n2klog import setTaskName
+
+#logging.setLevel(logging.VERBOSE)
+
 #import esp32can as can
 #import functools
-import asyncio
 #from asyncio import Queue
 from primitives.queue import Queue
-import time
 import aiorepl
 
 #import mip
+#mip.install("logging")
+#mip.install("aiorepl")
 #mip.install("github:peterhinch/micropython-async/v3/primitives")
 
 from n2kmsgs import *
 
-LOG_VERBOSE=0
-LOG_DEBUG=1
-LOG_NORMAL=2
-LOG_WARN=2
-LOG_ERROR=3
+LOG_VERBOSE=logging.VERBOSE
+LOG_DEBUG=logging.DEBUG
+LOG_NORMAL=logging.INFO
+LOG_WARN=logging.WARNING
+LOG_ERROR=logging.ERROR
 
-def log(level,msg,**kwargs):
-    if level>=LOG_DEBUG:
-        dt=time.ticks_ms()/1000
-        t=getTaskName(asyncio.current_task())
-        print("{dt:.3f}:{t}: {msg}".format(dt=dt,t=t,msg=msg.format(**kwargs)))
-
-tasks={}
-def setTaskName(task,name):
-    tasks[task]=name
-    asyncio.create_task(removeTaskName(task))
-
-async def removeTaskName(task):
-    await task
-    n=tasks.pop(task,None)
-    if n:
-        print(f"task {n} finished")
-    else:
-        print("no task name!")
-
-def getTaskName(task):
-    return tasks.get(task) or "?"
+logger=logging.getLogger("n2k")
+log=logger.log
 
 class n2kDevice:
     def __init__(self,bus,inst):
@@ -174,7 +161,7 @@ class n2kDevice:
             await asyncio.sleep_ms(100)
             # send claim
             self.name.src = addr
-            log(LOG_VERBOSE,"send claim inst:{i} addr:{a}",i=self.name.DeviceInstance,a=addr)
+            log(LOG_VERBOSE,"send claim inst:%s addr:%x",self.name.DeviceInstance,addr)
             await self.bus.sendMessage(self,self.name)
             self.addr_taken.clear()
             try:
@@ -182,7 +169,7 @@ class n2kDevice:
                 await asyncio.wait_for_ms(self.addr_taken.wait(),250)
             except asyncio.core.TimeoutError:
                 # claim successful
-                log(LOG_VERBOSE,"claimed inst:{i} addr:{a}",i=self.name.DeviceInstance,a=addr) 
+                log(LOG_VERBOSE,"claimed inst:%d addr:%x",self.name.DeviceInstance,addr) 
                 self.addr = addr
                 loop = False
                 while True:
@@ -190,7 +177,7 @@ class n2kDevice:
                         await asyncio.wait_for(self.addr_taken.wait(),60)
                         break
                     except asyncio.core.TimeoutError:
-                        log(LOG_VERBOSE,"send poll inst:{i} addr:{a}",i=self.name.DeviceInstance,a=addr)
+                        log(LOG_VERBOSE,"send poll inst:%d addr:%x",self.name.DeviceInstance,addr)
                         await self.bus.sendMessage(self,self.name)
                         continue
                     await asyncio.sleep(1)
@@ -219,11 +206,11 @@ class n2kDevice:
             msgInt = msg.GetNameInt()
             selfInt = self.name.GetNameInt()
             if msgInt < selfInt:
-                log(LOG_VERBOSE,"inst {i} has addr {a}",i=msg.DeviceInstance,a=msg.src)
+                log(LOG_VERBOSE,"inst %d has addr %x",msg.DeviceInstance,msg.src)
                 self.name.src = N2K_ADDR_NULL
                 self.addr_taken.set()
             elif msgInt > selfInt:
-                log(LOG_VERBOSE,"assert my addr {i}",i=self.name.DeviceInstance)
+                log(LOG_VERBOSE,"inst %d assert my addr",self.name.DeviceInstance)
                 self.addr_taken.set()
 #                await self.bus.sendMessage(self,self.name)
     
@@ -234,7 +221,7 @@ class n2kDevice:
             self.addr_taken.set()
             
     async def processISORequest(self,msg):
-        log(LOG_DEBUG,"Request msg {pgn} from {src}",pgn=msg.PGN,src=msg.src)
+        log(LOG_DEBUG,"Request msg %x from %x",msg.PGN,msg.src)
         entry=None
         for e in self.txmsgs.items():
             if e[0].pgn==msg.PGN:
@@ -258,7 +245,7 @@ class n2kDevice:
             m.PGN = msg.PGN
             m.ISO=True
             await self.sendMessage(m)
-            log(LOG_ERROR,"isoreg sent {m}",m=m)    
+            log(LOG_ERROR,"isoreg sent %s",m)    
 
     class ISOTPProcessor:
         def __init__(self,task,msgQueue,pgn):
@@ -440,7 +427,7 @@ class n2kBus:
             if msg is None:
                 print("no message {p}".format(p=pgn))
                 continue
-            log(LOG_DEBUG,"got msg {m} from {s}",s=src,m=type(msg))
+            log(LOG_DEBUG,"got msg %s from %x",type(msg),src)
             await self.processMessage(dev,msg)
     
     async def sendMessageParts(self,src,priority,srcAddr,dst,pgn,data):
@@ -491,7 +478,7 @@ class n2kBus:
                         log(LOG_NORMAL,"bam abort")
                         return
                     if not isinstance(msg,n2kISOTransportProtocolDataTransferMsg):
-                        log(LOG_ERROR,"Unexpected BAM:{msg}",msg=msg)
+                        log(LOG_ERROR,"Unexpected BAM:%s",msg)
                         return
                     if msg.Sequence<1 or msg.Sequence>BAM.Packets:
                         log(LOG_ERROR,"bam err seq")

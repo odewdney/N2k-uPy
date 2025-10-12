@@ -1,8 +1,9 @@
+import logging
 
 N2K_ADDR_BROADCAST=0xff
 N2K_ADDR_NULL=0xfe
 
-p=False
+log=logging.getLogger("n2kmsgs")
 
 msgs={}
 
@@ -81,7 +82,7 @@ class n2kField:
     def __set_name__(self,owner,name):
         self.name=name
         if self.index < 1: # virtual field
-            print(f"setting f2:{self} for {owner}")
+            log.debug(f"setting f2:{self} for {owner}")
             f2=getattr(owner,"fields2",[])
             if "fields2" not in owner.__dict__: owner.fields2=f2=f2.copy()
             f2.append(self)
@@ -146,7 +147,7 @@ class n2kByteField(n2kField):
         return (self.GetFieldSlice(obj)[0] >> self.bitoffset) & ((1<<self.bits)-1)
     def __set__(self,obj,value):
         offset=self.GetOffset(obj)
-        if p: print(f"setting {self.name} {obj} {offset} {value}")
+        log.debug(f"setting {self.name} {obj} {offset} {value}")
         s=self.GetSlice(obj,offset+1)
         mask=((1<<self.bits)-1)
         value=(value&mask)<<self.bitoffset
@@ -181,7 +182,7 @@ class n2kUIntNField(n2kField):
         value= (value&mask)<<self.bitoffset
         mask=~(mask<<self.bitoffset)
         data = (data & mask) | value
-        if p: print(f"setting {b.hex()} {self.fieldsize} {data.to_bytes(self.fieldsize,self.order).hex()}")
+        log.debug(f"setting {b.hex()} {self.fieldsize} {data.to_bytes(self.fieldsize,self.order).hex()}")
         b[0:self.fieldsize]=data.to_bytes(self.fieldsize,self.order)
     def GetValueSize(self):
         return (self.bits+7)//8
@@ -490,7 +491,7 @@ class n2kCompoundField(n2kField):
         self.obj=obj
         super().__init__(index,offset)
         self.fields=self.fields.copy()
-        if p: print(f"setting fields on {obj} {index} {offset}")
+        log.debug(f"setting fields on {obj} {index} {offset}")
         for n in range(len(self.fields)):
             f=self.fields[n].clone(index+n,offset)
             f.obj=self
@@ -498,7 +499,7 @@ class n2kCompoundField(n2kField):
             self.fields[n]=f
             #setattr(self,f.name,f)
             #object.__setattr__(self,f.name,f)
-            if p: print(f"set name:{f.name} {f.index} {f.offset}")
+            log.debug(f"set name:{f.name} {f.index} {f.offset}")
     def __set_name__(self,owner,name):
         for f in self.fields:
             f.__set_name__(owner,f"{name}.{f.name}")
@@ -573,7 +574,7 @@ class n2kArrayFieldImpl:
         self._SetCount()
         return l
     def init(self,obj):
-        if p: print(f"init {obj}")
+        log.debug(f"init {obj}")
         if not hasattr(obj,"data"): return
         data=obj.data
         offset=self.GetOffset(obj)
@@ -712,7 +713,7 @@ def test():
 
 m=None
 def t():
-    global p,m
+    global m
 #    p=True
     print("create")
     m=n2kNMEARequestGroupMsg()
@@ -724,7 +725,6 @@ def t():
     m.Parameters[0].Index=1
     print("value")
     m.Parameters[0].Value="hello"
-    p=False
     
 if __name__ == '__main__':
     test()
