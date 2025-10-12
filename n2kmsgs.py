@@ -23,6 +23,9 @@ def CreateMsgObject(pgn,priority,src,dst,data):
     msg=msgentry(priority=priority,src=src,dst=dst,data=data)
     return msg
 
+def IsManu(pgn):
+    return pgn==0xef00 or (pgn>=0xff00 and pgn<=0xffff) or pgn==0x1ef00 or (pgn>=0x1ff00 and pgn<=0x1ffff)
+
 def n2kMsgType(priority=6,pgn=None,fast=None,indexed=None,match=None):
     def decorator(klass):
         nonlocal fast
@@ -43,24 +46,24 @@ def n2kMsgType(priority=6,pgn=None,fast=None,indexed=None,match=None):
         if (pgn<0x1f000 or pgn>0x1feff) and fast is not None: # not in mixed range
             log(LOG_WARN,"Unexpected fast for pgn:{pgn}",pgn=pgn)
         if pgn>=0xe800 and pgn<=0xefff:
-            fast,pdu,manu=(fast or False),1,pgn==0xef00
+            fast,pdu=(fast or False),1
         elif pgn>=0xf000 and pgn<=0xffff:
-            fast,pdu,manu=(fast or False),2,pgn>=0xff00
+            fast,pdu=(fast or False),2
         elif pgn>=0x1ed00 and pgn<=0x1efff:
-            fast,pdu,manu=(fast or True),1,pgn==0x1ef00
+            fast,pdu=(fast or True),1
         elif pgn>=0x1f000 and pgn<=0x1feff: # mixed fast
-            fast,pdu,manu=(fast or False),2,False
+            fast,pdu=(fast or False),2
         elif pgn>=0x1ff00 and pgn<=0x1ffff:
-            fast,pdu,manu=(fast or True),1,True
+            fast,pdu=(fast or True),1
         elif pgn==0:
-            fast,pdu,manu=False,1,False
+            fast,pdu=False,1
         else:
             log(LOG_ERROR,"unexpected pdu:{pdu}",pdu=pdu)
 
         if pdu==1 and (pgn&0xff)!=0:
             log(LOG_ERROR,"unexpected dst in pgn:{pgn}",pgn=pgn)
         klass.pdu=pdu
-        klass.manu=manu
+        klass.manu=IsManu(pgn)
         klass.fast=fast
         if indexed: klass.indexed=indexed
         if match: klass.match=match
@@ -79,7 +82,9 @@ class n2kField:
         self.name=name
         if self.index < 1: # virtual field
             print(f"setting f2:{self} for {owner}")
-            owner.fields2=self
+            f2=getattr(owner,"fields2",[])
+            if "fields2" not in owner.__dict__: owner.fields2=f2=f2.copy()
+            f2.append(self)
             return
         f=getattr(owner,"fields",[])
         if "fields" not in owner.__dict__:
@@ -278,7 +283,8 @@ class n2kMsg:
             for f in self.fields:
                 f.init(self)
         if hasattr(self,"fields2"):
-            self.fields2.init(self)
+            for n in range(len(self.fields2)):
+                self.fields2[n].init(self)
     def __repr__(self):
         s = "{name} PGN={pgn} src={src} dst={dst}:".format(name=type(self).__name__,pgn=self.pgn,src=self.src,dst=self.dst)
         for f in self.fields:
@@ -598,7 +604,8 @@ class n2kArrayField(n2kField):
         val=getattr(obj,"_"+self.name,None)
         return val.GetFieldSize(obj) if val else 0
     def init(self,obj):
-        print("init1")
+        if not hasattr(obj,"data"): return
+        self.__get__(obj).init(obj)
 
 @n2kMsgType(pgn=126208, priority=3, match=b'\x00') # 0x1ED00
 class n2kNMEARequestGroupMsg(n2kNMEAGroupFunctionBase):
@@ -623,13 +630,11 @@ class n2kNMEAAckGroupMsg(n2kNMEAGroupFunctionBase):
 
 class n2kUInt16FieldX(n2kUInt16Field):
     def GetFieldSize(self,obj):
-        m=msgs.get(obj.PGN)
-        if m and m.manu:
+        if IsManu(obj.PGN):
             return super().GetFieldSize(obj)
         return 0
 
-@n2kMsgType(pgn=126208, priority=3, match=b'\x03') # 0x1ED00
-class n2kNMEAReadFieldsGroupMsg(n2kNMEAGroupFunctionBase):
+class n2kNMEAFieldsGroupBase(n2kNMEAGroupFunctionBase):
     ManufacturerCode = n2kUInt16FieldX(3,4,bitoffset=0,bits=11,repr='mcode')
     reserved = n2kUInt16FieldX(4,4,bitoffset=11,bits=2,repr='mcode')
     IndustryGroup = n2kUInt16FieldX(5,4,bits=3,bitoffset=13,default=4,repr='ig',enum=n2kIndustryCode) # marine
@@ -637,19 +642,22 @@ class n2kNMEAReadFieldsGroupMsg(n2kNMEAGroupFunctionBase):
     SelectionCount = n2kByteField(7,UniqueID)
     ParameterCount = n2kByteField(8,SelectionCount)
     Selections = n2kArrayField(9,ParameterCount,type=n2kParamObj,count=SelectionCount)
-    Parameters = n2kArrayField(10,Selections,type=n2kByteField,count=ParameterCount)
-                               
+
+@n2kMsgType(pgn=126208, priority=3, match=b'\x03') # 0x1ED00
+class n2kNMEAReadFieldsGroupMsg(n2kNMEAFieldsGroupBase):
+    Parameters = n2kArrayField(10,n2kNMEAFieldsGroupBase.Selections,type=n2kByteField,count=n2kNMEAFieldsGroupBase.ParameterCount)
+
 @n2kMsgType(pgn=126208, priority=3, match=b'\x04') # 0x1ED00
-class n2kNMEAReadFieldsReplyGroupMsg(n2kNMEAGroupFunctionBase):
-    pass    
+class n2kNMEAReadFieldsReplyGroupMsg(n2kNMEAFieldsGroupBase):
+    Parameters = n2kArrayField(10,n2kNMEAFieldsGroupBase.Selections,type=n2kParamObj,count=n2kNMEAFieldsGroupBase.ParameterCount)
 
 @n2kMsgType(pgn=126208, priority=3, match=b'\x05') # 0x1ED00
-class n2kNMEAWriteFieldsGroupMsg(n2kNMEAGroupFunctionBase):
-    pass    
+class n2kNMEAWriteFieldsGroupMsg(n2kNMEAFieldsGroupBase):
+    Parameters = n2kArrayField(10,n2kNMEAFieldsGroupBase.Selections,type=n2kParamObj,count=n2kNMEAFieldsGroupBase.ParameterCount)
 
 @n2kMsgType(pgn=126208, priority=3, match=b'\x06') # 0x1ED00
-class n2kNMEAWriteFieldsReplyGroupMsg(n2kNMEAGroupFunctionBase):
-    pass    
+class n2kNMEAWriteFieldsReplyGroupMsg(n2kNMEAFieldsGroupBase):
+    Parameters = n2kArrayField(10,n2kNMEAFieldsGroupBase.Selections,type=n2kParamObj,count=n2kNMEAFieldsGroupBase.ParameterCount)
 
 @n2kMsgType(pgn=126464) # 0x1EE00
 class n2kNMEAPGNList(n2kMsg):
