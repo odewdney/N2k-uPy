@@ -19,14 +19,29 @@ def GetMsgClass(pgn,data=None):
         msgentry=lambda priority,src,dst,data:n2kUnknownMsg(pgn=pgn,priority=priority,src=src,dst=dst,data=data)
     return msgentry
 
-def CreateMsgObject(pgn,priority,src,dst,data):
-    msgentry=GetMsgClass(pgn,data)
+def CreateMsgObject(pgn,priority,src,dst,data,fast=False):
+    if fast and IsFast(pgn):
+        msgentry=lambda priority,src,dst,data:(n2kNmeaFastMsg if data and len(data)>0 and (data[0]&0xf)!=0 else n2kNmeaFastFirstMsg)(pgn=pgn,priority=priority,src=src,dst=dst,data=data)
+    else:
+        msgentry=GetMsgClass(pgn,data)
     msg=msgentry(priority=priority,src=src,dst=dst,data=data)
     return msg
 
 def IsManu(pgn):
     return pgn==0xef00 or (pgn>=0xff00 and pgn<=0xffff) or pgn==0x1ef00 or (pgn>=0x1ff00 and pgn<=0x1ffff)
 
+def IsFast(pgn):
+    if pgn>=0x1f000 and pgn<=0x1feff: return None # mixed
+    return (pgn>=0x1ed00 and pgn<=0x1efff) or (pgn>=0x1ff00 and pgn<=0x1ffff)
+
+def getPDU(pgn):
+    if (pgn>=0xe800 and pgn<=0xefff) or (pgn>=0x1ed00 and pgn<=0x1efff) or pgn>=0x1ff00 and pgn<=0x1ffff:
+        return 1
+    if (pgn>=0xf000 and pgn<=0xffff) or (pgn>=0x1f000 and pgn<=0x1feff):
+        return 2
+    if pgn==0:
+        return 1
+    
 def n2kMsgType(priority=6,pgn=None,fast=None,indexed=None,match=None):
     def decorator(klass):
         nonlocal fast
@@ -44,25 +59,21 @@ def n2kMsgType(priority=6,pgn=None,fast=None,indexed=None,match=None):
             msgentry[match]=klass
         klass.pgn=pgn
         klass.priority=priority
-        if (pgn<0x1f000 or pgn>0x1feff) and fast is not None: # not in mixed range
-            log(LOG_WARN,"Unexpected fast for pgn:{pgn}",pgn=pgn)
-        if pgn>=0xe800 and pgn<=0xefff:
-            fast,pdu=(fast or False),1
-        elif pgn>=0xf000 and pgn<=0xffff:
-            fast,pdu=(fast or False),2
-        elif pgn>=0x1ed00 and pgn<=0x1efff:
-            fast,pdu=(fast or True),1
-        elif pgn>=0x1f000 and pgn<=0x1feff: # mixed fast
-            fast,pdu=(fast or False),2
-        elif pgn>=0x1ff00 and pgn<=0x1ffff:
-            fast,pdu=(fast or True),1
-        elif pgn==0:
-            fast,pdu=False,1
+        pgnfast=IsFast(pgn)
+        if pgnfast is None:
+            if fast is None:
+                log.warning("No fast for %x",pgn)
+        elif fast is not None: # not in mixed range
+            log.warning("Unexpected fast for pgn:%x",pgn)
         else:
-            log(LOG_ERROR,"unexpected pdu:{pdu}",pdu=pdu)
+            fast=pgnfast
 
+        pdu=getPDU(pgn)
+        if pdu is None:
+            log.error("unexpected pdu:%x",pgn)
         if pdu==1 and (pgn&0xff)!=0:
-            log(LOG_ERROR,"unexpected dst in pgn:{pgn}",pgn=pgn)
+            log.error("unexpected dst in pgn:%x",pgn)
+
         klass.pdu=pdu
         klass.manu=IsManu(pgn)
         klass.fast=fast
@@ -323,6 +334,18 @@ class n2kMsg:
 @n2kMsgType(pgn=0)
 class n2kUnknownMsg(n2kMsg):
     body=n2kByteField(1,0)
+    
+@n2kMsgType(pgn=0)
+class n2kNmeaFastBase(n2kMsg):
+    Seq=n2kByteField(1,0,bitoffset=4,bits=4)
+    Frame=n2kByteField(2,0,bitoffset=0,bits=4)
+
+class n2kNmeaFastFirstMsg(n2kNmeaFastBase):
+    PacketLength=n2kByteField(3,1)
+    Data6=n2kDataField(5,2,6)
+    
+class n2kNmeaFastMsg(n2kNmeaFastBase):
+    Data7=n2kDataField(3,1,7)
 
 @n2kMsgType(pgn=59392) # 0xe800
 class n2kISOAcknowledgementMsg(n2kMsg):
@@ -668,7 +691,7 @@ class n2kNMEAPGNList(n2kMsg):
         TX=0
         RX=1
 
-@n2kMsgType(pgn=126993, priority=7) # 0x1F011
+@n2kMsgType(pgn=126993, priority=7, fast=False) # 0x1F011
 class n2kHeartbeatMsg(n2kMsg):
     Offset = n2kUInt16Field(1,0)
     Sequence = n2kByteField(2,2)
