@@ -82,13 +82,63 @@ def n2kMsgType(priority=6,pgn=None,fast=None,indexed=None,match=None):
         return klass
     return decorator
 
+class n2kValue:
+    pass
+class n2kNAValue(n2kValue):
+    def __init__(self,value,bits):
+        self.bits=bits
+        if bits>=12: self.value=value
+    def __repr__(self):
+        if self.bits>=12 and self.value!=((1<<self.bits)-1):
+            return f"NA:{self.value&((1<<(self.bits-8))-1)}"
+        return "NA"
+    def __bool__(self):
+        return False
+    def __int__(self):
+        return self.getValue()
+    def __index__(self):
+        return self.getValue()
+    def getValue(self):
+        if self.bits<12: return (1<<self.bits)-1
+        return self.value
+    @staticmethod
+    def isNAValue(value,bits):
+        if bits<2: return False
+        if bits<12:
+            return value==((1<<bits)-1)
+        return (value>>(bits-8))==0xff
+    
+class n2kErrorValue(n2kValue):
+    def __init__(self,value,bits):
+        self.bits=bits
+        if bits>=12: self.value=value
+    def __repr__(self):
+        if self.bits>=12:
+            return f"Err:{self.value&((1<<(self.bits-8))-1)}"
+        return "Err"
+    def __int__(self):
+        return self.getValue()
+    def __index__(self):
+        return self.getValue()
+    def getValue(self):
+        if self.bits<12: return (1<<self.bits)-1
+        return self.value
+    @staticmethod
+    def isErrValue(value,bits):
+        if bits<2: return False
+        if bits<12:
+            return value==((1<<bits)-2)
+        return (value>>(bits-8))==0xfe
+    
 class n2kField:
-    def __init__(self,index,offset,default=None,scale=None,unit=None,repr=None,enum=None,name=None):
+    def __init__(self,index,offset,default=None,scale=None,unit=None,repr=None,enum=None,nullable=True,errorable=True,name=None):
         self.index=index
         self.offset=offset
         self.default=default
         if repr is not None: self.repr=repr
         if enum: self.enum=enum
+        self.nullable=nullable
+        self.errorable=errorable
         if name: self.name=name
     def __set_name__(self,owner,name):
         self.name=name
@@ -154,14 +204,16 @@ class n2kByteField(n2kField):
     def clone(self,index,offset):
         return super().clone(index,offset,bitoffset=self.bitoffset,bits=self.bits)
     def __get__(self,obj,objtype=None):
-        #offset=self.GetOffset(obj)
-        return (self.GetFieldSlice(obj)[0] >> self.bitoffset) & ((1<<self.bits)-1)
+        val=(self.GetFieldSlice(obj)[0] >> self.bitoffset) & ((1<<self.bits)-1)
+        if self.nullable and n2kNAValue.isNAValue(val,self.bits):
+            return n2kNAValue(val,self.bits)
+        return val
     def __set__(self,obj,value):
         offset=self.GetOffset(obj)
         log.debug(f"setting {self.name} {obj} {offset} {value}")
         s=self.GetSlice(obj,offset+1)
         mask=((1<<self.bits)-1)
-        value=(value&mask)<<self.bitoffset
+        value=(int(value)&mask)<<self.bitoffset
         mask=~(mask<<self.bitoffset)
         s[offset] = (s[offset] & mask) | value
 
@@ -181,18 +233,20 @@ class n2kUIntNField(n2kField):
         b=self.GetFieldSlice(obj)
         value=int.from_bytes(b,self.order)
         value=(value >> self.bitoffset) & ((1<<self.bits)-1)
+        if self.nullable and n2kNAValue.isNAValue(value,self.bits): return n2kNAValue(value,self.bits)
         if hasattr(self,"scale"): value*=self.scale
         if hasattr(self,"voffset"): value+=self.voffset
         return value
     def __set__(self,obj,value):
-        if hasattr(self,"voffset"): value-=self.voffset
-        if hasattr(self,"scale"): value=round(value/self.scale)
+        if not isinstance(value,n2kValue):
+            if hasattr(self,"voffset"): value-=self.voffset
+            if hasattr(self,"scale"): value=round(value/self.scale)
         b=self.GetFieldSlice(obj)
         data=int.from_bytes(b,self.order)
-        mask = ((1<<self.bits)-1)
-        value= (value&mask)<<self.bitoffset
+        mask=((1<<self.bits)-1)
+        value=(int(value)&mask)<<self.bitoffset
         mask=~(mask<<self.bitoffset)
-        data = (data & mask) | value
+        data=(data & mask) | value
         log.debug(f"setting {b.hex()} {self.fieldsize} {data.to_bytes(self.fieldsize,self.order).hex()}")
         b[0:self.fieldsize]=data.to_bytes(self.fieldsize,self.order)
     def GetValueSize(self):
@@ -490,6 +544,7 @@ class n2kParamField(n2kField):
         if not isinstance(obj,n2kParamObj): obj=self.obj
         pgn=obj.obj.PGN
         index=obj.Index
+        if isinstance(index,n2kNAValue): return None
         #print(f"Lookup {pgn} {index}")
         cls=msgs.get(pgn)
         if not cls or index==0xff:
@@ -691,19 +746,24 @@ class n2kNMEAPGNList(n2kMsg):
         TX=0
         RX=1
 
+class CtrlEnum(n2kEnum):
+    ErrorActive=0
+    ErrorPassive=1
+    BusOff=2
+class EquipStatusEnum(n2kEnum):
+    Operational=0
+    Fault=1
+
 @n2kMsgType(pgn=126993, priority=7, fast=False) # 0x1F011
 class n2kHeartbeatMsg(n2kMsg):
-    Offset = n2kUInt16Field(1,0)
+    Offset = n2kUInt16Field(1,0,unit="s",scale=0.01)
     Sequence = n2kByteField(2,2)
-    ControllerState1 = n2kByteField(3,3,bits=2,bitoffset=0,default=3)
-    ControllerState2 = n2kByteField(4,3,bits=2,bitoffset=2,default=3)
-    EquipmentState = n2kByteField(5,3,bits=2,bitoffset=4,default=3)
-    reserved1 = n2kByteField(6,3,bits=2,bitoffset=6,default=3)
-    reserved2 = n2kUInt32Field(7,4,default=-1)
-    
-    def update(self):
-        Sequence = Sequence+1 if Sequence < 252 else 0
-    
+    ControllerState1 = n2kByteField(3,3,bits=2,bitoffset=0,default=3,enum=CtrlEnum)
+    ControllerState2 = n2kByteField(4,3,bits=2,bitoffset=2,default=3,enum=CtrlEnum)
+    EquipmentState = n2kByteField(5,3,bits=2,bitoffset=4,default=0,enum=EquipStatusEnum)
+    reserved1 = n2kByteField(6,3,bits=2,bitoffset=6)
+    reserved2 = n2kUInt32Field(7,4)
+        
 @n2kMsgType(pgn=126996, fast=True ) # 0x1F014
 class n2kProductInformationMsg(n2kMsg):
     Version = n2kUInt16Field(1,0)
@@ -750,4 +810,8 @@ def t():
     m.Parameters[0].Value="hello"
     
 if __name__ == '__main__':
+    level=logging.DEBUG
+    logger=logging.getLogger()
+    logger.setLevel(level)
+    logger.handlers[0].setLevel(level)
     test()

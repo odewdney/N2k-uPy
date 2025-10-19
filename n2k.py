@@ -9,6 +9,7 @@ from n2klog import setTaskName
 #from asyncio import Queue
 from primitives.queue import Queue
 import aiorepl
+import esp32
 
 #import mip
 #mip.install("logging")
@@ -26,10 +27,124 @@ LOG_ERROR=logging.ERROR
 logger=logging.getLogger("n2k")
 log=logger.log
 
+class NmeaAckException(Exception):
+    def __init__(msg,pgn,pgnErr,priErr,params=None):
+        super().__init__(msg)
+        self.pgn=pgn
+        self.pgnErr=pgnErr
+        self.priErr=priErr
+        self.params=params
+
+class MsgHandler:
+    def __init__(self,dev,msg=None,pgn=None,offset=None,interval=None):
+        self.dev=dev
+        self.log=dev.log
+        self.msg=msg
+        self.pgn=msg.pgn if msg else pgn 
+        self.task=None
+        self.ev=asyncio.Event()
+        self.defInt=interval
+        self.interval=self.getSetting("i",interval)
+        self.offset=self.getSetting("o",offset)
+    def settingKey(self,key):
+        return f"{self.pgn:x}.{key}"
+    def getSetting(self,key,default=None):
+        return self.dev.getSetting(self.settingKey(key),default)
+    def setSetting(self,key,value):
+        return self.dev.getSetting(self.settingKey(key),value)
+    def start(self):
+        self.task=asyncio.create_task(self.runner())
+        setTaskName(self.task,f"dev-{self.dev.inst}:{self.pgn}")
+    def stop(self):
+        self.task.cancel()
+        self.task=None
+    async def runner(self):
+        cnt=0
+        while True:
+            self.ev.clear()
+            if self.interval:
+                await self.sendRepeatMsg(cnt)
+                cnt+=1
+                try:
+                    await asyncio.wait_for(self.ev.wait(),self.interval if cnt>0 else self.offset)
+                    cnt=0
+                except asyncio.core.TimeoutError:
+                    continue
+            else:
+                await self.ev.wait()
+    async def sendRepeatMsg(self,cnt):
+        self.log.debug(f"sending {self.pgn:x} {cnt}")
+    def createAck(self,pgnErr=0,priErr=0,params=None):
+        msg=n2kNMEAAckGroupMsg()
+        msg.PGN=self.pgn
+        msg.ErrorCode=pgnErr
+        msg.ErrorCode2=priErr
+        return msg
+    async def GetISOMessage(self):
+        return msg
+    def NmeaRequest(self,interval,offset):
+        if not isinstance(offset,n2kNAValue):
+            if offset==0: offset=None
+            self.offset=offset
+            self.setSetting("o",offset)
+        if isinstance(interval,n2kNAValue) and interval.GetValue()==0xfffffffe:
+            interval=self.defInt
+        if not isinstance(interval,n2kNAValue):
+            if interval==0: interval=None
+            self.interval=interval
+            self.setSetting("i",interval)
+        elif isinstance(offset,n2kNAValue):
+            return msg
+        self.ev.set()
+        return self.createAck()
+    def NmeaCommand(self,priority):
+        if pri>=10: #reseved
+            return self.createAck(0,4)
+        if pri!=8: # no change
+            if pri==9: #default
+                pri=self.msg.__class__.priority
+            if self.msg:
+                self.msg.priority=priority
+            else:
+                self.priority=priority
+        return self.createAck()
+    def NmeaRead(self,data):
+        pass
+    def NmeaWrite(self,data):
+        pass
+
+    
+class Heartbeat(MsgHandler):
+    def __init__(self,dev,msg):
+        super().__init__(dev,msg,offset=1,interval=10)
+        msg.Sequence=0
+    def update(self):
+        msg=self.msg
+        msg.Offset=self.interval
+        msg.Sequence = msg.Sequence+1 if msg.Sequence < 252 else 0
+        msg.EquipmentState=EquipStatusEnum.Operational
+    async def sendRepeatMsg(self,cnt):
+        self.log.info(f"sending {self.pgn:x} {cnt}")
+        self.update()
+        await self.dev.sendMessage(self.msg)
+    def GetISOMessage(self):
+        raise NmeaAckException("GetIso not allowed",self.pgn,0,0)
+    def NmeaCommand(self,priority):
+        raise NmeaAckException("NmeaCmd not allowed",self.pgn,4,4)
+    def NmeaRequest(self,interval,offset):
+        if interval<1 or interval>60:
+            raise NmeaAckException("NmeaReq bad int",self.pgn,0,1)
+        if isinstance(interval,n2kmsgs.n2kNAValue) and isinstance(offset,n2kmsgs.n2kNAValue):
+            raise NmeaAckException("Nmea cant req hb",self.pgn,3,1)
+        super().NmeaRequest(interval,offset)
+    
 class n2kDevice:
     def __init__(self,bus,inst):
         self.bus=bus
         self.inst=inst
+        self.log=logging.getLogger(f"n2kdev={inst}")
+        self.nvs=esp32.NVS(f"dev-{inst}")
+        
         self.addr = N2K_ADDR_NULL
         self.task=None
         self.name = n2kISOAddressClaimMsg()
@@ -46,7 +161,7 @@ class n2kDevice:
         self.pi.ModelID = "test"
         
         self.conf = n2kConfigurationInformationMsg()
-        self.conf.InstallationDescription1 = "desc1"
+        self.conf.InstallationDescription1 = self.getSetting("desc1","desc1")
         self.conf.InstallationDescription2 = "desc2"
         self.conf.ManufacturerDescription = "mdesc"
         
@@ -55,7 +170,7 @@ class n2kDevice:
         self.txmsgs = {n2kISOAcknowledgementMsg:None,n2kISORequestMsg:None,
                      n2kISOTransportProtocolConnectionManagementBase:None, n2kISOTransportProtocolDataTransferMsg:None,
                      # n2k group, txrxlist
-                     type(self.name):self.name,type(self.pi):self.pi,type(self.conf):self.conf,type(self.heartbeat):self.heartbeat,
+                     type(self.name):self.name,type(self.pi):self.pi,type(self.conf):self.conf,type(self.heartbeat):Heartbeat(self,self.heartbeat),
                      n2kNMEAPGNList:self.processPGNList}
         
         self.rxmsgs = {n2kISOAcknowledgementMsg:None,n2kISORequestMsg:self.processISORequest,
@@ -63,7 +178,27 @@ class n2kDevice:
                        n2kISOAddressClaimMsg:self.processISOAddressClaim,n2kISOCommandedAddressMsg:self.processISOCommandedAddress,
                        n2kNMEAGroupFunctionBase:self.processNMEAGroupFunctionMsg}
         self.msgProcessors = {}
-
+    def getSetting(self,key,default=None):
+        try:
+            return self.nvs.get_i32(key)
+        except:
+            return default
+    def setSetting(self,key,value):
+        if value is None:
+            self.nvs.erase_key(key)
+        else:
+            self.nvs.set_i32(key,value)
+            self.nvs.commit()
+    settingBuffer=bytearray(50)
+    def getSettingStr(self,key,default):
+        try:
+            l=self.nvs.get_blob(key,settingBuffer)
+            return settingBuffer[:l].decode()
+        except OSError as err:
+            # not found or but too samll
+            return default
+    def setSettingStr(self,key,value):
+        self.nvs.set_blob(key,value)
     async def sendMessage(self,msg):
         if self.addr==N2K_ADDR_NULL:
             log(LOG_ERROR,"Cant send with no addr")
@@ -76,6 +211,8 @@ class n2kDevice:
                 task=asyncio.create_task(self.sendISOMessage(msg))
                 setTaskName(task,f"sendISO({self.inst})")
             return
+        elif msg.fast:
+            print("sending fast")
         msg.src=self.addr
         await self.bus.sendMessage(self,msg)
 
@@ -132,7 +269,7 @@ class n2kDevice:
                 if not isinstance(cts,n2kISOTransportProtocolConnectionCTSMsg):
                     log(LOG_WARN,"unexpected TP msg")
                     return
-                if cts.NextSID>p:
+                if (cts.NextSID+cts.MaxPackets)>p:
                     log(LOG_ERROR,"bad nSID")
                 for s in range(cts.NextSID, min(p+1,cts.NextSID+cts.MaxPackets)):
                     m=n2kISOTransportProtocolDataTransferMsg()
@@ -149,10 +286,16 @@ class n2kDevice:
             raise Exception("already started")
         self.task=asyncio.create_task(self.run_addr_claim())
         setTaskName(self.task,f"addr({self.inst})")
+        for m in self.txmsgs.items():
+            if isinstance(m[1],MsgHandler):
+                m[1].start()
     def stop(self):
         if self.task is not None:
             self.task.cancel()
             self.task=None
+        for m in self.txmsgs.items():
+            if isinstance(m[1],MsgHandler):
+                m[1].stop()
     async def run_addr_claim(self):
         addr = 0
         loop = False
@@ -352,7 +495,7 @@ class n2kDevice:
         if entries:
             for entry in entries:
                 log(LOG_DEBUG,f"{self.addr}: sending to {entry}")
-                processed |= await entry.processMsg(msg)
+                processed |= await entry.processMsg(msg) or False
 #        entry = self.rxmsgs.get(type(msg))
         entry=None
         for e in self.rxmsgs.items():
@@ -396,6 +539,7 @@ class n2kBus:
         self.task=None
         self.queue = Queue()
         self.bamMsgs={}
+        self.log=logging.getLogger("n2kbus")
         
     def AddDevice(self,dev):
         self.devices.append(dev)
@@ -422,17 +566,17 @@ class n2kBus:
         while True:
             #await asyncio.sleep(1)
             (dev,pri,src,dst,pgn,data) = await self.queue.get()
-            print(f"rm: {pgn} {src} {dst} {data}")
+            self.log.log(LOG_VERBOSE,f"rm: {pgn} {src} {dst} {data}")
             msg = CreateMsgObject(pgn,pri,src,dst,data)
             if msg is None:
                 print("no message {p}".format(p=pgn))
                 continue
-            log(LOG_DEBUG,"got msg %s from %x",type(msg),src)
+            self.log.log(LOG_DEBUG,"got msg %s from %x",type(msg),src)
             await self.processMessage(dev,msg)
     
     async def sendMessageParts(self,src,priority,srcAddr,dst,pgn,data):
         if not isinstance(data,bytes): data=bytes(data)
-        print(f"sm: {pgn} {srcAddr} {dst} {data}")
+        self.log.log(LOG_VERBOSE,f"sm: {pgn} {srcAddr} {dst} {data}")
         await self.queue.put((src,priority,srcAddr,dst,pgn,data))
     async def sendMessage(self,src,msg):
         await self.sendMessageParts(src,msg.priority,msg.src,msg.dst,msg.pgn,bytes(msg.data))
@@ -472,16 +616,16 @@ class n2kBus:
                     try:
                         msg=await asyncio.wait_for_ms(msgQueue.get(),2000)
                     except asyncio.core.TimeoutError:
-                        log(LOG_WARN, "bam timeout")
+                        self.log.log(LOG_WARN, "bam timeout")
                         return
                     if isinstance(msg,n2kISOTransportProtocolConnectionAbortMsg):
-                        log(LOG_NORMAL,"bam abort")
+                        self.log.log(LOG_NORMAL,"bam abort")
                         return
                     if not isinstance(msg,n2kISOTransportProtocolDataTransferMsg):
-                        log(LOG_ERROR,"Unexpected BAM:%s",msg)
+                        self.log.log(LOG_ERROR,"Unexpected BAM:%s",msg)
                         return
                     if msg.Sequence<1 or msg.Sequence>BAM.Packets:
-                        log(LOG_ERROR,"bam err seq")
+                        self.log.log(LOG_ERROR,"bam err seq")
                         return
                     if msgs[msg.Sequence-1] is None:
                         npkts+=1
@@ -492,7 +636,7 @@ class n2kBus:
 
         entry = self.bamMsgs.get(msg.src)
         if entry:
-            log(LOG_WARN,"canceling bam")
+            self.log.log(LOG_WARN,"canceling bam")
             entry.cancel()
         #self.bamMsgs[msg.src] = self.ISOBAMMsgProcessor(self,src,msg,self.BAMMessageRegister(msg.src))
         processor=BAMProcessor()
@@ -506,7 +650,7 @@ class n2kBus:
         if entry:
             await entry.processMsg(src,msg)
         else:
-            log(LOG_ERROR,"no bam proc")
+            self.log.log(LOG_ERROR,"no bam proc")
         
     async def processMessage(self,src,msg):
         log(LOG_DEBUG,f"{src.addr if src else None}: {msg}")
@@ -526,7 +670,8 @@ class n2kBus:
     async def sendCanMessage(self,msg):
         #log(LOG_DEBUG,"send {m}",m=msg)
         # pri[3] res[1] DP[1] PF[8] PS[8] src[8]
-        pass
+        if self.can:
+            await self.can.sendMessage(msg)
 
 class n2kDebugDevice(n2kDevice):
     def __init__(self,bus):
@@ -615,7 +760,14 @@ n.AddDevice(d1)
 dd=n2kDebugDevice(n)
 n.AddDevice(dd)
 
-n.SetCan(1)
+import CanEth
+config=esp32.NVS("config")
+host_buf=bytearray(20)
+host_len=config.get_blob("host",host_buf)
+host=host_buf[:host_len].decode()
+CanEth.setupWifi()
+c=CanEth.CanEth(host)
+n.SetCan(c)
 
 async def waiter():
     n.start()
@@ -623,7 +775,10 @@ async def waiter():
     setTaskName(repl,"repl")
     log(LOG_DEBUG,"starting")
     #await asyncio.gather(asyncio.sleep(100),repl)
-    await asyncio.wait_for(repl,100)
+    try:
+        await asyncio.wait_for(repl,100)
+    except asyncio.core.TimeoutError:
+        print("Time out")
     print("stopping")
     n.stop()
     await asyncio.sleep_ms(100)
