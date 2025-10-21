@@ -3,6 +3,13 @@ import esp32
 import socket
 import time
 
+def configWifi(ssid,pwd):
+    nvs=esp32.NVS("wifi")
+    nvs.set_i32("enabled",1)
+    nvs.set_blob("ssid",ssid)
+    nvs.set_blob("pass",pwd)
+    nvs.commit()
+
 def setupWifi():
     nvs=esp32.NVS("wifi")
     try:
@@ -13,19 +20,23 @@ def setupWifi():
                 l=nvs.get_blob(key,buf)
                 return buf[:l].decode()
             w=network.WLAN()
+            if w.status()==network.STAT_GOT_IP: return
             w.active(True)
             w.connect(getStr("ssid"),getStr("pass"))
             
             # Wait for connect or fail
             max_wait = 10
             while max_wait > 0:
-                if w.status() < 0 or w.status() >= 3:
+                status=w.status()
+                if status not in [network.STAT_IDLE,network.STAT_CONNECTING]:
+                    if status!=network.STAT_GOT_IP:
+                        print(f"connection status...{status}")
                     break
                 max_wait -= 1
-                print('waiting for connection...')
+                print(f'waiting for connection...{status}')
                 time.sleep(1)
-    finally:
-        pass
+    except Exception as e:
+        print(f"setup wifi failed {e}")
 
 #https://www.proconx.com/assets/files/products/caneth/canframe.pdf
 class CanEth:

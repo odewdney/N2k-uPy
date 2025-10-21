@@ -363,6 +363,8 @@ class n2kMsg:
                 if hasattr(f,"unit"): value=f"{value}{f.unit}"
                 s += " {name}:{value}".format(name=name,value=value)
         return s
+    def clone(self):
+        return self.__class__(src=self.src,dst=self.dst,priority=self.priority,data=bytes(self.data))
     def GetSlice(self,length):
         obj=self
         if len(obj.dataview) < length:
@@ -738,13 +740,20 @@ class n2kNMEAWriteFieldsGroupMsg(n2kNMEAFieldsGroupBase):
 class n2kNMEAWriteFieldsReplyGroupMsg(n2kNMEAFieldsGroupBase):
     Parameters = n2kArrayField(10,n2kNMEAFieldsGroupBase.Selections,type=n2kParamObj,count=n2kNMEAFieldsGroupBase.ParameterCount)
 
+class PGNFunctionCodes(n2kEnum):
+    TX=0
+    RX=1
 @n2kMsgType(pgn=126464) # 0x1EE00
 class n2kNMEAPGNList(n2kMsg):
-    FunctionCode=n2kByteField(1,0)
+    FunctionCode=n2kByteField(1,0,enum=PGNFunctionCodes)
     PGNs=n2kArrayField(2,1,n2kUInt24Field)
-    class FunctionCodes:
-        TX=0
-        RX=1
+@n2kMsgType(pgn=126464,match=b'\x00') # 0x1EE00
+class n2kNMEAPGNListTx(n2kNMEAPGNList):
+    pass
+@n2kMsgType(pgn=126464,match=b'\x01') # 0x1EE00
+class n2kNMEAPGNListRx(n2kNMEAPGNList):
+    pass
+
 
 class CtrlEnum(n2kEnum):
     ErrorActive=0
@@ -784,7 +793,7 @@ class n2kConfigurationInformationMsg(n2kMsg):
 x=None
 def test():
     global x
-    d=b'\x12\x34\x56\x78\x12\x34\x56'
+    d=b'\x00\x34\x56\x78\x12\x34\x56'
     #d=bytearray(d)
     x=n2kNMEAPGNList(data=d)
     #x.PGNs.add()

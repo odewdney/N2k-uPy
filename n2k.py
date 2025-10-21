@@ -40,7 +40,13 @@ class MsgHandler:
         self.dev=dev
         self.log=dev.log
         self.msg=msg
-        self.pgn=msg.pgn if msg else pgn 
+        if msg:
+            self.pgn=msg.pgn
+            p=self.getSetting("p")
+            if p: msg.priority=p
+        else:
+            self.pgn=pgn
+            self.priority=self.getSetting("p")
         self.task=None
         self.ev=asyncio.Event()
         self.defInt=interval
@@ -81,7 +87,8 @@ class MsgHandler:
         msg.ErrorCode2=priErr
         return msg
     async def GetISOMessage(self):
-        return msg
+        if not self.msg: raise NmeaAckException("no msg of iso",self.pgn,0,0)
+        return self.msg.clone()
     def NmeaRequest(self,interval,offset):
         if not isinstance(offset,n2kNAValue):
             if offset==0: offset=None
@@ -94,7 +101,7 @@ class MsgHandler:
             self.interval=interval
             self.setSetting("i",interval)
         elif isinstance(offset,n2kNAValue):
-            return msg
+            return self.msg.clone()
         self.ev.set()
         return self.createAck()
     def NmeaCommand(self,priority):
@@ -102,11 +109,12 @@ class MsgHandler:
             return self.createAck(0,4)
         if pri!=8: # no change
             if pri==9: #default
-                pri=self.msg.__class__.priority
+                pri=self.msg.__class__.priority if self.msg else None
             if self.msg:
                 self.msg.priority=priority
             else:
                 self.priority=priority
+            self.setSetting("p",priority if pri!=9 else None)
         return self.createAck()
     def NmeaRead(self,data):
         pass
@@ -136,8 +144,30 @@ class Heartbeat(MsgHandler):
             raise NmeaAckException("NmeaReq bad int",self.pgn,0,1)
         if isinstance(interval,n2kmsgs.n2kNAValue) and isinstance(offset,n2kmsgs.n2kNAValue):
             raise NmeaAckException("Nmea cant req hb",self.pgn,3,1)
-        super().NmeaRequest(interval,offset)
-    
+        return super().NmeaRequest(interval,offset)
+
+class PGNListMsgHandler(MsgHandler):
+    def __init__(self,dev,tx):
+        super().__init__(dev,pgn=n2kNMEAPGNList.pgn)
+        self.tx=tx
+        #if hasattr(msg,"ISO"):
+        #    m.ISO=True
+        #await self.sendMessage(m)
+        #await domsgs(n2kNMEAPGNList.FunctionCodes.TX,self.txmsgs)
+        #await domsgs(n2kNMEAPGNList.FunctionCodes.RX,self.rxmsgs)
+    def GetISOMessage(self):
+        msgs=self.dev.txmsgs if self.tx else self.dev.rxmsgs
+        m=n2kNMEAPGNListTx() if self.tx else n2kNMEAPGNListRx()
+        if self.priority: m.priority=self.priority
+        distinct=[]
+        for mm in msgs.keys():
+            pgn=mm.pgn
+            if not pgn in distinct:
+                n=m.PGNs.add()
+                m.PGNs[n]=pgn
+                distinct.append(pgn)
+        return m
+
 class n2kDevice:
     def __init__(self,bus,inst):
         self.bus=bus
@@ -167,17 +197,29 @@ class n2kDevice:
         
         self.heartbeat = n2kHeartbeatMsg()
         
-        self.txmsgs = {n2kISOAcknowledgementMsg:None,n2kISORequestMsg:None,
-                     n2kISOTransportProtocolConnectionManagementBase:None, n2kISOTransportProtocolDataTransferMsg:None,
+        self.txmsgs = {n2kISOAcknowledgementMsg:None,
+                     n2kISORequestMsg:None,
+                     n2kISOTransportProtocolConnectionManagementBase:None,
+                     n2kISOTransportProtocolDataTransferMsg:None,
                      # n2k group, txrxlist
-                     type(self.name):self.name,type(self.pi):self.pi,type(self.conf):self.conf,type(self.heartbeat):Heartbeat(self,self.heartbeat),
-                     n2kNMEAPGNList:self.processPGNList}
+                     type(self.name):self.name,
+                     type(self.pi):MsgHandler(self,self.pi),
+                     type(self.conf):MsgHandler(self,self.conf),
+                     type(self.heartbeat):Heartbeat(self,self.heartbeat),
+#                     n2kNMEAPGNList:PGNListMsgHandler(self)
+                     n2kNMEAPGNListTx:PGNListMsgHandler(self,tx=True),
+                     n2kNMEAPGNListRx:PGNListMsgHandler(self,tx=False)
+                     }
         
-        self.rxmsgs = {n2kISOAcknowledgementMsg:None,n2kISORequestMsg:self.processISORequest,
-                       n2kISOTransportProtocolConnectionManagementBase:self.processISOTPMsg,n2kISOTransportProtocolDataTransferMsg:None,
-                       n2kISOAddressClaimMsg:self.processISOAddressClaim,n2kISOCommandedAddressMsg:self.processISOCommandedAddress,
+        self.rxmsgs = {n2kISOAcknowledgementMsg:True,
+                       n2kISORequestMsg:self.processISORequest,
+                       n2kISOTransportProtocolConnectionManagementBase:self.processISOTPMsg,
+                       n2kISOTransportProtocolDataTransferMsg:None,
+                       n2kISOAddressClaimMsg:self.processISOAddressClaim,
+                       n2kISOCommandedAddressMsg:self.processISOCommandedAddress,
                        n2kNMEAGroupFunctionBase:self.processNMEAGroupFunctionMsg}
         self.msgProcessors = {}
+        self.msgSenders = {}
     def getSetting(self,key,default=None):
         try:
             return self.nvs.get_i32(key)
@@ -199,22 +241,44 @@ class n2kDevice:
             return default
     def setSettingStr(self,key,value):
         self.nvs.set_blob(key,value)
+
     async def sendMessage(self,msg):
         if self.addr==N2K_ADDR_NULL:
             log(LOG_ERROR,"Cant send with no addr")
             return
+        msg.src=self.addr
+        if (hasattr(msg,"ISO") and len(msg.data)>8) or msg.fast:
+            # multi msg
+            print("queuing")
+            dst=msg.dst
+            queue = self.msgSenders.get(dst)
+            if not queue:
+                print("creating q")
+                queue=Queue()
+                self.msgSenders[dst]=queue
+                task=asyncio.create_task(self.sendMessageQueue(dst,queue))
+                setTaskName(task,f"sendQ-{self.addr}-{msg.dst}")
+            await queue.put(msg)
+        else:
+            await self.bus.sendMessage(self,msg)
+    async def sendMessageQueue(self,dst,queue):
+        print("qproc start")
+        while not queue.empty():
+            msg=await queue.get()
+            await self.sendMessageImpl(msg)
+        del self.msgSenders[dst]
+        print("qproc end")
+    async def sendMessageImpl(self,msg):
         if hasattr(msg,"ISO") and len(msg.data)>8:
             if msg.dst==N2K_ADDR_BROADCAST:
-                task=asyncio.create_task(self.sendISOBAMMessage(msg))
-                setTaskName(task,f"sendBAM({self.inst})")
+                await self.sendISOBAMMessage(msg)
             else:
-                task=asyncio.create_task(self.sendISOMessage(msg))
-                setTaskName(task,f"sendISO({self.inst})")
-            return
+                await self.sendISOMessage(msg)
         elif msg.fast:
             print("sending fast")
-        msg.src=self.addr
-        await self.bus.sendMessage(self,msg)
+            await self.bus.sendMessage(self,msg)
+        else
+            await self.bus.sendMessage(self,msg)
 
     async def sendISOBAMMessage(self,msg):
         l=len(msg.data)
@@ -236,7 +300,6 @@ class n2kDevice:
             m.Sequence=n+1
             m.Data=msg.data[n*7:(n+1)*7]
             await self.bus.sendMessage(self,m)
-        
 
     async def sendISOMessage(self,msg):
         l=len(msg.data)
@@ -259,6 +322,7 @@ class n2kDevice:
                 try:
                     cts = await asyncio.wait_for_ms(msgQueue.get(),2000)
                 except asyncio.core.TimeoutError:
+                    self.log.warning("sendISO timeout")
                     abort=n2kISOTransportProtocolConnectionAbortMsg(dst=msg.dst,src=self.addr)
                     abort.PGN=msg.pgn
                     abort.Reason=3 #timeout
@@ -267,11 +331,13 @@ class n2kDevice:
                 if isinstance(cts,n2kISOTransportProtocolConnectionEOMMsg):
                     return
                 if not isinstance(cts,n2kISOTransportProtocolConnectionCTSMsg):
-                    log(LOG_WARN,"unexpected TP msg")
+                    self.log.warn("unexpected TP msg %s",cts)
                     return
-                if (cts.NextSID+cts.MaxPackets)>p:
-                    log(LOG_ERROR,"bad nSID")
-                for s in range(cts.NextSID, min(p+1,cts.NextSID+cts.MaxPackets)):
+                last=cts.NextSID+cts.MaxPackets
+                if last>(p+1):
+                    self.log.error("bad nSID n:%d m:%d p:%d",cts.NextSID,cts.MaxPackets,p)
+                    last=p+1
+                for s in range(cts.NextSID, last):
                     m=n2kISOTransportProtocolDataTransferMsg()
                     m.priority=msg.priority
                     m.dst=msg.dst
@@ -279,7 +345,6 @@ class n2kDevice:
                     m.Sequence=s
                     m.Data=msg.data[(s-1)*7:s*7]
                     await self.bus.sendMessage(self,m)
-        
 
     def start(self):
         if self.task is not None:
@@ -364,31 +429,39 @@ class n2kDevice:
             self.addr_taken.set()
             
     async def processISORequest(self,msg):
-        log(LOG_DEBUG,"Request msg %x from %x",msg.PGN,msg.src)
-        entry=None
-        for e in self.txmsgs.items():
-            if e[0].pgn==msg.PGN:
-                entry = e
-        if entry:
-            entryType = entry[0]
-            entryValue = entry[1]
-            if callable(entryValue):
-                await entryValue(msg)
-            else:
-                for e in (entryValue if isinstance(entryValue,list) else [entryValue]):
-                    m=entryType()
-                    m.dst=msg.src if msg.PGN!=n2kISOAddressClaimMsg.pgn else N2K_ADDR_BROADCAST
-                    m.data=bytes(e.data)
+        self.log.warning("Request msg %x from %x",msg.PGN,msg.src)
+        dst=msg.src if msg.PGN!=n2kISOAddressClaimMsg.pgn else N2K_ADDR_BROADCAST
+        processed=False
+        try:
+            for e in self.txmsgs.items():
+                entryType = e[0]
+                entryValue = e[1]
+                if entryType.pgn!=msg.PGN: continue
+                processed=True
+                if callable(entryValue):
+                    await entryValue(msg)
+                elif isinstance(entryValue, MsgHandler):
+                    m=entryValue.GetISOMessage()
+                    m.dst=dst
                     m.ISO=True
                     await self.sendMessage(m)
-        elif msg.dst!=N2K_ADDR_BROADCAST:
+                else:
+                    for e in (entryValue if isinstance(entryValue,list) else [entryValue]):
+                        m=entryValue.clone()
+                        m.dst=dst
+                        m.ISO=True
+                        await self.sendMessage(m)
+        except NmeaAckException as exc:
+            self.log.error(exc)
+            processed=False
+        if not processed and msg.dst!=N2K_ADDR_BROADCAST:
             m=n2kISOAcknowledgementMsg(dst=msg.src)
             m.Control = 1# NACK
             m.GroupFunction = 0xff
             m.PGN = msg.PGN
             m.ISO=True
             await self.sendMessage(m)
-            log(LOG_ERROR,"isoreg sent %s",m)    
+            self.log.error("isoreg sent %s",m)    
 
     class ISOTPProcessor:
         def __init__(self,task,msgQueue,pgn):
@@ -458,25 +531,12 @@ class n2kDevice:
         processor=n2kDevice.ISOTPProcessor(task,msgQueue,pgn)
         task=asyncio.create_task(run(self.registerMessageProcessor(msg.src,processor)))
         setTaskName(task,f"procRTS({self.inst})")
+        return task
     
     async def processISOTPMsg(self,msg):
         if isinstance(msg,n2kISOTransportProtocolConnectionRTSMsg):
             await self.processRTS(msg)
-        
-    async def processPGNList(self,msg):
-        async def domsgs(fc,msgs):
-            m=n2kNMEAPGNList()
-            m.dst=msg.src
-            m.FunctionCode=fc
-            for mm in msgs.keys():
-                n=m.PGNs.add()
-                m.PGNs[n]=mm.pgn
-            if hasattr(msg,"ISO"):
-                m.ISO=True
-            await self.sendMessage(m)
-        await domsgs(n2kNMEAPGNList.FunctionCodes.TX,self.txmsgs)
-        await domsgs(n2kNMEAPGNList.FunctionCodes.RX,self.rxmsgs)
-        
+                
     async def processNMEAGroupFunctionMsg(self,msg):
         if isinstance(msg,n2kNMEAAckGroupMsg):
             return
@@ -500,10 +560,13 @@ class n2kDevice:
         entry=None
         for e in self.rxmsgs.items():
             if isinstance(msg,e[0]):
-                entry=e[1]
+                entry=e
                 break
         if entry:
-            return await entry(msg)
+            func=entry[1]
+            if callable(func):
+                return await func(msg)
+            processed |= func or False
         if not processed and msg.dst!=N2K_ADDR_BROADCAST:
             m=n2kISOAcknowledgementMsg(dst=msg.src)
             m.Control = 1# NACK
@@ -692,6 +755,7 @@ class n2kDebugDevice(n2kDevice):
             async def processMsg(self,msg):
                 nonlocal response,ev
                 log(LOG_DEBUG,"proc")
+                print(msg)
                 if isinstance(msg,n2kISOAcknowledgementMsg):
                     response = msg
                     ev.set()
