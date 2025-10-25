@@ -344,13 +344,20 @@ class n2kMsg:
             self.data = bytearray(self.match)
         else:
             self.data=bytearray()
-        self.dataview=memoryview(self.data)
+ #       self.dataview=memoryview(self.data)
         if hasattr(self,"fields"):
             for f in self.fields:
                 f.init(self)
         if hasattr(self,"fields2"):
             for n in range(len(self.fields2)):
                 self.fields2[n].init(self)
+    @property
+    def data(self):
+        return self._data
+    @data.setter
+    def data(self,value):
+        self._data=value
+        self.dataview=memoryview(value)
     def __repr__(self):
         s = "{name} PGN={pgn} src={src} dst={dst}:".format(name=type(self).__name__,pgn=self.pgn,src=self.src,dst=self.dst)
         for f in self.fields:
@@ -371,7 +378,7 @@ class n2kMsg:
             data=obj.data
             data.extend((length-len(data))*b'\xff')
             obj.data=data
-            obj.dataview=memoryview(data)
+            #obj.dataview=memoryview(data)
         return obj.dataview
     def GetResizedSlice(self,offset,curlen,length):
         data=self.data
@@ -384,7 +391,7 @@ class n2kMsg:
             data[offset+length:len(data)-ext]=data[offset+curlen:]
             data=data[:len(data)-ext]
         self.data=data
-        self.dataview=memoryview(data)
+        #self.dataview=memoryview(data)
         return self.dataview[offset:offset+length]
 
 @n2kMsgType(pgn=0)
@@ -393,8 +400,8 @@ class n2kUnknownMsg(n2kMsg):
     
 @n2kMsgType(pgn=0)
 class n2kNmeaFastBase(n2kMsg):
-    Seq=n2kByteField(1,0,bitoffset=4,bits=4)
-    Frame=n2kByteField(2,0,bitoffset=0,bits=4)
+    Seq=n2kByteField(1,0,bitoffset=5,bits=3)
+    Frame=n2kByteField(2,0,bitoffset=0,bits=5)
 
 class n2kNmeaFastFirstMsg(n2kNmeaFastBase):
     PacketLength=n2kByteField(3,1)
