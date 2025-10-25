@@ -9,12 +9,14 @@ from n2klog import setTaskName
 #from asyncio import Queue
 from primitives.queue import Queue
 import aiorepl
+from ucontextlib import contextmanager
 import esp32
 
 #import mip
 #mip.install("logging")
 #mip.install("aiorepl")
 #mip.install("github:peterhinch/micropython-async/v3/primitives")
+#mip.install("ucontextlib")
 
 from n2kmsgs import *
 
@@ -159,7 +161,7 @@ class PGNListMsgHandler(MsgHandler):
         msgs=self.dev.txmsgs if self.tx else self.dev.rxmsgs
         m=n2kNMEAPGNListTx() if self.tx else n2kNMEAPGNListRx()
         if self.priority: m.priority=self.priority
-        distinct=[]
+        distinct=[0]
         for mm in msgs.keys():
             pgn=mm.pgn
             if not pgn in distinct:
@@ -211,7 +213,8 @@ class n2kDevice:
                      n2kNMEAPGNListRx:PGNListMsgHandler(self,tx=False)
                      }
         
-        self.rxmsgs = {n2kISOAcknowledgementMsg:True,
+        self.rxmsgs = {n2kNmeaFastBase:self.processFastMsg,
+                       n2kISOAcknowledgementMsg:True,
                        n2kISORequestMsg:self.processISORequest,
                        n2kISOTransportProtocolConnectionManagementBase:self.processISOTPMsg,
                        n2kISOTransportProtocolDataTransferMsg:None,
@@ -277,7 +280,7 @@ class n2kDevice:
         elif msg.fast:
             print("sending fast")
             await self.bus.sendMessage(self,msg)
-        else
+        else:
             await self.bus.sendMessage(self,msg)
 
     async def sendISOBAMMessage(self,msg):
@@ -331,7 +334,7 @@ class n2kDevice:
                 if isinstance(cts,n2kISOTransportProtocolConnectionEOMMsg):
                     return
                 if not isinstance(cts,n2kISOTransportProtocolConnectionCTSMsg):
-                    self.log.warn("unexpected TP msg %s",cts)
+                    self.log.warning("unexpected TP msg %s",cts)
                     return
                 last=cts.NextSID+cts.MaxPackets
                 if last>(p+1):
@@ -424,9 +427,11 @@ class n2kDevice:
     
     async def processISOCommandedAddress(self,msg):
         if msg.GetNameInt() == self.name.GetNameInt():
-            log(LOG_DEBUG,f"addr: {self.name.src} => {msg.NewSourceAddress}")
+            self.log.debug("addr: %d=>%d",self.name.src,msg.NewSourceAddress)
             self.name.src = msg.NewSourceAddress
             self.addr_taken.set()
+        else:
+            self.log.error("command addr not for us")
             
     async def processISORequest(self,msg):
         self.log.warning("Request msg %x from %x",msg.PGN,msg.src)
@@ -463,24 +468,21 @@ class n2kDevice:
             await self.sendMessage(m)
             self.log.error("isoreg sent %s",m)    
 
-    class ISOTPProcessor:
-        def __init__(self,task,msgQueue,pgn):
-            self.task=task
-            self.msgQueue=msgQueue
-            self.pgn=pgn
-        def cancel(self):
-            self.task.cancel()
-        async def processMsg(self,msg2):
-            if isinstance(msg2, n2kISOTransportProtocolConnectionManagementBase) and msg2.PGN==self.pgn:
-                log(LOG_DEBUG,"got TP")
-                await self.msgQueue.put(msg2)
-                return True
+    def ISOTPProcessor(self,msgQueue,pgn):
+        f=False
+        while True:
+            msg2=yield f
+            if isinstance(msg2, n2kISOTransportProtocolConnectionManagementBase) and msg2.PGN==pgn:
+                self.log.debug("got TP")
+                msgQueue.put_nowait(msg2)
+                f=True
             elif isinstance(msg2, n2kISOTransportProtocolDataTransferMsg):
-                log(LOG_DEBUG,"got data")
-                await self.msgQueue.put(msg2)
-                return True
+                self.log.debug("got data")
+                msgQueue.put_nowait(msg2)
+                f=True
             else:
-                log(LOG_DEBUG,"no processed")
+                self.log.debug("no processed")
+                f=False
 
     async def processRTS(self,msg):
         pgn=msg.PGN
@@ -528,7 +530,7 @@ class n2kDevice:
  #       if entries:
  #           for entry in entries:
  #               entry.cancel()
-        processor=n2kDevice.ISOTPProcessor(task,msgQueue,pgn)
+        processor=self.ISOTPProcessor(msgQueue,pgn)
         task=asyncio.create_task(run(self.registerMessageProcessor(msg.src,processor)))
         setTaskName(task,f"procRTS({self.inst})")
         return task
@@ -536,7 +538,56 @@ class n2kDevice:
     async def processISOTPMsg(self,msg):
         if isinstance(msg,n2kISOTransportProtocolConnectionRTSMsg):
             await self.processRTS(msg)
-                
+    
+    def FastProcessor(self,pgn,seq,queue):
+        try:
+            f=False
+            while True:
+                msg2=yield f
+                if isinstance(msg2,n2kNmeaFastBase) and msg2.Seq==seq:
+                    queue.put_nowait(msg2)
+                    msg2.fp=True
+                    f=True
+                else:
+                    f=False
+        except GeneratorExit:
+            queue.put(None)
+
+    async def processFastMsg(self,msg):
+        if hasattr(msg,"fp"): return
+        msgQueue=Queue()
+        pkts=[]
+        target=0xffffffff
+        actual=0
+        pktlen=0
+        def update(msg):
+            f=msg.Frame
+            actual|=1<<f
+            if f==0:
+                pktlen=msg.PacketLength
+                pkts=1+pktlen//7
+                target=(1<<pkts)-1
+                data=msg.data[2:]
+            else:
+                data=msg.data[1:]
+            if f<=len(pkts): pkts.extend([None for x in range(1+f-len(pkts))])
+            pkts[f]=data
+            return actual==target
+        async def run(regCtx):
+            with regCtx():
+                while True:
+                    m = await asyncio.wait_for_ms(msgQueue.get(),2000)
+                    if not m: return
+                    if update(msg):
+                         break
+            data=(b''.join(pkts))[:pktlen]
+            mm=CreateMsgObject(msg.pgn,msg.priority,self.addr,data,fast=False)
+            self.bus.sendMessage(None,mm)
+        update(msg)
+        processor=FastProcessor(msg.pgn,msg.Seq,msgQueue)
+        task=asyncio.create_task(run(self.RegisterMessageProcessor(msg.src,processor)))
+        setTaskName(task,f"fastProc{msg.pgn}")
+    
     async def processNMEAGroupFunctionMsg(self,msg):
         if isinstance(msg,n2kNMEAAckGroupMsg):
             return
@@ -555,7 +606,7 @@ class n2kDevice:
         if entries:
             for entry in entries:
                 log(LOG_DEBUG,f"{self.addr}: sending to {entry}")
-                processed |= await entry.processMsg(msg) or False
+                processed |= entry.send(msg) or False
 #        entry = self.rxmsgs.get(type(msg))
         entry=None
         for e in self.rxmsgs.items():
@@ -575,24 +626,27 @@ class n2kDevice:
             await self.sendMessage(m)
 
     def registerMessageProcessor(self,src,proc):
-        class msgReg:
-            def __enter__(self2):
-                pass
-            def __exit__(self2, exc_type, exc_value, traceback):
-                nonlocal self,src,proc
+        @contextmanger
+        def msgReg():
+            nonlocal self,src,proc
+            try:
+                yield
+            finally:
                 procs=self.msgProcessors.get(src)
-                if proc in procs:
-                    log(LOG_DEBUG,f"{self.addr}: remove proc {proc} l:{len(procs)}")
+                try:
+                    self.log.debug("remove proc %s l:%d",proc,len(procs))
                     procs.remove(proc)
-                    if len(procs)==0:
-                        log(LOG_DEBUG,"no more procs")
+                    if not procs:
+                        self.log.debug("no more procs")
                         self.msgProcessors.pop(src,None)
-                else:
-                    log(LOG_ERROR,"unexpected proc")
-        procs=self.msgProcessors.get(src,[])
+                    proc.exit()
+                except ValueError:
+                    self.log.error("unexpected proc")
+        proc.send(None)
+        procs=self.msgProcessors.get(src,None)
+        if procs is None: procs=self.msgProcessors[src]=[]
         procs.append(proc)
-        log(LOG_DEBUG,f"{self.addr}: procs added {proc} len {len(procs)}")
-        self.msgProcessors[src]=procs
+        self.log.debug("procs added %s len %d",proc,len(procs))
         return msgReg
         
 class n2kBus:
@@ -627,35 +681,32 @@ class n2kBus:
     
     async def run(self):
         while True:
-            #await asyncio.sleep(1)
-            (dev,pri,src,dst,pgn,data) = await self.queue.get()
-            self.log.log(LOG_VERBOSE,f"rm: {pgn} {src} {dst} {data}")
-            msg = CreateMsgObject(pgn,pri,src,dst,data)
-            if msg is None:
-                print("no message {p}".format(p=pgn))
-                continue
-            self.log.log(LOG_DEBUG,"got msg %s from %x",type(msg),src)
+            (dev,msg)=await self.queue.get()
+            self.log.debug("got msg %s from %x",type(msg),msg.src)
             await self.processMessage(dev,msg)
     
-    async def sendMessageParts(self,src,priority,srcAddr,dst,pgn,data):
-        if not isinstance(data,bytes): data=bytes(data)
-        self.log.log(LOG_VERBOSE,f"sm: {pgn} {srcAddr} {dst} {data}")
-        await self.queue.put((src,priority,srcAddr,dst,pgn,data))
     async def sendMessage(self,src,msg):
-        await self.sendMessageParts(src,msg.priority,msg.src,msg.dst,msg.pgn,bytes(msg.data))
+        self.log.log(LOG_VERBOSE,f"sm: %d %d %d %s",msg.pgn,msg.src,msg.dst,msg.data)
+        if not isinstance(msg.data,bytes): msg=msg.clone()
+        await self.queue.put((src,msg))
         
-    def BAMMessageRegister(self,src):
-        class BAMMessageRegisterCtx:
-            def __init__(self,processor):
-                self.processor=processor
-            def __enter__(self2):
-                pass
-            def __exit__(self2,exc_type, exc_value, traceback):
-                nonlocal self,src
-                if self.bamMsgs.get(src)==self2.processor:
+    def BAMMessageRegister(self,src,processor):
+        @contextmanager
+        def BAMMessageRegisterCtx():
+            try:
+                yield
+            finally:
+                nonlocal self,src,processor
+                if self.bamMsgs.get(src)==processor:
                     self.bamMsgs.pop(src,None)
                 else:
                     log(LOG_WARN,"not me as proc")
+        entry = self.bamMsgs.get(src)
+        if entry:
+            self.log.warning("canceling bam")
+            entry.close()
+        self.bamMsgs[src] = processor
+        processor.send(None)
         return BAMMessageRegisterCtx
     
     async def processTPBAMMsg(self,src,msg):
@@ -663,59 +714,54 @@ class n2kBus:
         msgQueue = Queue()
         BAM=msg
         processor=None
-        class BAMProcessor:
-            def cancel(self):
-                nonlocal task
+        def BAMProcessor():
+            try:
+                while True:
+                    (src,msg2)=yield True
+                    msgQueue.put_nowait(msg2)
+            except GeneratorExit:
                 task.cancel()
-            async def processMsg(self,src,msg):
-                nonlocal msgQueue
-                await msgQueue.put(msg)
         async def run(regMsg):
             nonlocal BAM,msgQueue,src,processor
             msgs=BAM.Packets*[None]
             npkts=0
-            with regMsg(processor):
+            with regMsg():
                 while npkts<BAM.Packets:
                     try:
                         msg=await asyncio.wait_for_ms(msgQueue.get(),2000)
                     except asyncio.core.TimeoutError:
-                        self.log.log(LOG_WARN, "bam timeout")
+                        self.log.warning("bam timeout")
                         return
                     if isinstance(msg,n2kISOTransportProtocolConnectionAbortMsg):
-                        self.log.log(LOG_NORMAL,"bam abort")
+                        self.log.info("bam abort")
                         return
                     if not isinstance(msg,n2kISOTransportProtocolDataTransferMsg):
-                        self.log.log(LOG_ERROR,"Unexpected BAM:%s",msg)
+                        self.log.error("Unexpected BAM:%s",msg)
                         return
                     if msg.Sequence<1 or msg.Sequence>BAM.Packets:
-                        self.log.log(LOG_ERROR,"bam err seq")
+                        self.log.error("bam err seq")
                         return
                     if msgs[msg.Sequence-1] is None:
                         npkts+=1
                     msgs[msg.Sequence-1]=bytes(msg.Data)
             data=(b''.join(msgs))[:BAM.MessageSize]
             #print(data)
-            await self.sendMessageParts(src,BAM.priority,BAM.src,N2K_ADDR_BROADCAST,BAM.PGN,data)
+            m=CreateMsgObject(BAM.PGN,BAM.priority,BAM.src,N2K_ADDR_BROADCAST,data)
+            await self.sendMessage(src,m)
 
-        entry = self.bamMsgs.get(msg.src)
-        if entry:
-            self.log.log(LOG_WARN,"canceling bam")
-            entry.cancel()
-        #self.bamMsgs[msg.src] = self.ISOBAMMsgProcessor(self,src,msg,self.BAMMessageRegister(msg.src))
         processor=BAMProcessor()
-        
-        self.bamMsgs[msg.src] = processor
-        task=asyncio.create_task(run(self.BAMMessageRegister(msg.src)))
+        task=asyncio.create_task(run(self.BAMMessageRegister(msg.src,processor)))
         setTaskName(task,f"procBAM({msg.src})")
         
     async def processTPMsg(self,src,msg):
         entry = self.bamMsgs.get(msg.src)
         if entry:
-            await entry.processMsg(src,msg)
+            entry.send((src,msg))
         else:
             self.log.log(LOG_ERROR,"no bam proc")
         
     async def processMessage(self,src,msg):
+        self.log.warning("pm: %d s:%d d:%d %s", msg.pgn, msg.src,msg.dst,msg.data)
         log(LOG_DEBUG,f"{src.addr if src else None}: {msg}")
         if msg.dst==N2K_ADDR_BROADCAST:
             if isinstance(msg,n2kISOTransportProtocolConnectionBAMMsg):
@@ -731,8 +777,6 @@ class n2kBus:
             await self.sendCanMessage(msg)
     
     async def sendCanMessage(self,msg):
-        #log(LOG_DEBUG,"send {m}",m=msg)
-        # pri[3] res[1] DP[1] PF[8] PS[8] src[8]
         if self.can:
             await self.can.sendMessage(msg)
 
@@ -742,28 +786,33 @@ class n2kDebugDevice(n2kDevice):
     async def setAddr(self,d,addr=10):
         m=n2kISOCommandedAddressMsg()
         m.dst=d.addr
-        m.data=d.name.data
+        m.data=bytearray(d.name.data)
         m.NewSourceAddress=addr
-        await self.sendMessage(self,m)
+        await self.sendMessage(m)
 
     async def getISORequestResponse(self,pgn,addr,timeout=5000):
         response=None
         ev=asyncio.Event()
-        class ISOResponseProcessor:
-            def cancel(self):
+        def ISOResponseProcessor():
+            nonlocal response,ev
+            try:
+                f=False
+                while True:
+                    msg=yield f
+                    log(LOG_DEBUG,"proc")
+                    print(msg)
+                    if isinstance(msg,n2kISOAcknowledgementMsg) and msg.PGN==pgn:
+                        response = msg
+                        ev.set()
+                        f=True
+                    elif msg.pgn==pgn:
+                        response = msg
+                        ev.set()
+                        f=True
+                    else:
+                        f=False
+            except GeneratorExit:
                 ev.set()
-            async def processMsg(self,msg):
-                nonlocal response,ev
-                log(LOG_DEBUG,"proc")
-                print(msg)
-                if isinstance(msg,n2kISOAcknowledgementMsg):
-                    response = msg
-                    ev.set()
-                    return True
-                elif msg.pgn==pgn:
-                    response = msg
-                    ev.set()
-                    return True
         processor=ISOResponseProcessor()
         with self.registerMessageProcessor(addr,processor)():
             await asyncio.wait_for_ms(ev.wait(),timeout)
