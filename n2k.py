@@ -472,6 +472,7 @@ class n2kDevice:
         f=False
         while True:
             msg2=yield f
+            if not msg: break
             if isinstance(msg2, n2kISOTransportProtocolConnectionManagementBase) and msg2.PGN==pgn:
                 self.log.debug("got TP")
                 msgQueue.put_nowait(msg2)
@@ -544,9 +545,10 @@ class n2kDevice:
             f=False
             while True:
                 msg2=yield f
+                if not msg2: break
                 if isinstance(msg2,n2kNmeaFastBase) and msg2.Seq==seq:
-                    queue.put_nowait(msg2)
                     msg2.fp=True
+                    queue.put_nowait(msg2)
                     f=True
                 else:
                     f=False
@@ -639,7 +641,7 @@ class n2kDevice:
                     if not procs:
                         self.log.debug("no more procs")
                         self.msgProcessors.pop(src,None)
-                    proc.exit()
+                    proc.close()
                 except ValueError:
                     self.log.error("unexpected proc")
         proc.send(None)
@@ -699,28 +701,29 @@ class n2kBus:
                 nonlocal self,src,processor
                 if self.bamMsgs.get(src)==processor:
                     self.bamMsgs.pop(src,None)
+                    processor.send(None)
                 else:
                     log(LOG_WARN,"not me as proc")
         entry = self.bamMsgs.get(src)
         if entry:
             self.log.warning("canceling bam")
             entry.close()
-        self.bamMsgs[src] = processor
+        self.bamMsgs[src]=processor
         processor.send(None)
         return BAMMessageRegisterCtx
     
     async def processTPBAMMsg(self,src,msg):
-        task = None
-        msgQueue = Queue()
+        msgQueue=Queue()
         BAM=msg
         processor=None
         def BAMProcessor():
             try:
                 while True:
-                    (src,msg2)=yield True
+                    msg2=yield True
+                    if not msg2: break
                     msgQueue.put_nowait(msg2)
             except GeneratorExit:
-                task.cancel()
+                msgQueue.put_nowait(None)
         async def run(regMsg):
             nonlocal BAM,msgQueue,src,processor
             msgs=BAM.Packets*[None]
@@ -732,6 +735,7 @@ class n2kBus:
                     except asyncio.core.TimeoutError:
                         self.log.warning("bam timeout")
                         return
+                    if not msg: break
                     if isinstance(msg,n2kISOTransportProtocolConnectionAbortMsg):
                         self.log.info("bam abort")
                         return
@@ -756,13 +760,13 @@ class n2kBus:
     async def processTPMsg(self,src,msg):
         entry = self.bamMsgs.get(msg.src)
         if entry:
-            entry.send((src,msg))
+            entry.send(msg)
         else:
-            self.log.log(LOG_ERROR,"no bam proc")
+            self.log.error("no bam proc")
         
     async def processMessage(self,src,msg):
         self.log.warning("pm: %d s:%d d:%d %s", msg.pgn, msg.src,msg.dst,msg.data)
-        log(LOG_DEBUG,f"{src.addr if src else None}: {msg}")
+        self.log.debug("%s: %s",src.addr if src else None,msg)
         if msg.dst==N2K_ADDR_BROADCAST:
             if isinstance(msg,n2kISOTransportProtocolConnectionBAMMsg):
                 return await self.processTPBAMMsg(src,msg)
@@ -799,13 +803,10 @@ class n2kDebugDevice(n2kDevice):
                 f=False
                 while True:
                     msg=yield f
+                    if not msg: break
                     log(LOG_DEBUG,"proc")
                     print(msg)
-                    if isinstance(msg,n2kISOAcknowledgementMsg) and msg.PGN==pgn:
-                        response = msg
-                        ev.set()
-                        f=True
-                    elif msg.pgn==pgn:
+                    if (isinstance(msg,n2kISOAcknowledgementMsg) and msg.PGN==pgn) or msg.pgn==pgn:
                         response = msg
                         ev.set()
                         f=True
